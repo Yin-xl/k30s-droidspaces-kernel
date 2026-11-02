@@ -29,7 +29,7 @@ jobs:
             device-tree-compiler cpio python3 rsync zip unzip wget git \
             liblz4-tool zlib1g-dev
 
-      - name: 拉取小米开源内核（apollo-q-oss, 4.19.113）
+      - name: 拉取小米开源内核（apollo-q-oss，源码基线 4.19.81）
         run: git clone --depth=1 -b apollo-q-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel
 
       - name: 拉取工具链（clang r383902 + gcc 4.9 预编译）
@@ -61,17 +61,57 @@ jobs:
           fi
           tail -20 kernel/arch/arm64/configs/vendor/apollo_miui_defconfig
 
-      - name: 编译
+      - name: 修补老内核在新工具链上的已知问题
         run: |
           set -e
+          # 1) 小米只放出了 Android 10 的 apollo 源码（4.19.81），真机是 4.19.113。
+          #    把 SUBLEVEL 顶到 113，让 UTS_RELEASE 与原厂模块 vermagic 逐字一致：
+          #    4.19.113-perf-g62242b28117e
+          sed -i 's/^SUBLEVEL = 81$/SUBLEVEL = 113/' kernel/Makefile
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+
+          # 2) gcc 10+ 默认 -fno-common，导致 dtc 的 yylloc 重复定义
+          #    (multiple definition of `yylloc')。改成 extern 声明。
+          sed -i 's/^YYLTYPE yylloc;$/extern YYLTYPE yylloc;/' kernel/scripts/dtc/dtc-lexer.l
+          grep -n 'yylloc;' kernel/scripts/dtc/dtc-lexer.l | head -3
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          set -x
           export PATH="$PWD/clang/bin:$PATH"
+          clang --version || true
+          make --version | head -1
           mkdir -p out
+          # HOSTCFLAGS=-fcommon：兜一层，防止其它老 host 工具再撞 -fno-common
           COMMON="ARCH=arm64 SUBARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=$PWD/gcc64/bin/aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=$PWD/gcc32/bin/arm-linux-androideabi-"
-          make -C kernel O=$PWD/out $COMMON vendor/apollo_miui_defconfig
-          make -C kernel O=$PWD/out $COMMON -j$(nproc) 2>&1 | tee build.log
+            CROSS_COMPILE_ARM32=$PWD/gcc32/bin/arm-linux-androideabi- \
+            HOSTCFLAGS=-fcommon"
+          make -C kernel O=$PWD/out $COMMON vendor/apollo_miui_defconfig 2>&1 | tee -a build.log
+          make -C kernel O=$PWD/out $COMMON -j$(nproc) 2>&1 | tee -a build.log
+
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "===== 关键配置是否生效 ====="
+          grep -E '^CONFIG_(PID_NS|IPC_NS|SYSVIPC|LOCALVERSION|LOCALVERSION_AUTO|DEVTMPFS)=' out/.config 2>/dev/null || echo "(out/.config 不存在，说明 defconfig 阶段就失败了)"
+
+      - name: 失败诊断-日志回显
+        if: failure()
+        run: |
+          # 把 build.log 最后 20 行逐行变成 error 标注，这样仓库是 public 时
+          # 可以直接通过 /check-runs/{id}/annotations 从外部读到，无需登录下载日志
+          N=0
+          tail -n 20 build.log 2>/dev/null | while IFS= read -r line; do
+            N=$((N+1))
+            clean=$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g; s/\r//g' | cut -c1-300)
+            echo "::error title=build.log tail #$N::$clean"
+          done
+          if [ ! -f build.log ]; then
+            echo "::error title=no build.log::build.log 不存在，说明 make 前就退出了"
+          fi
 
       - name: 校验产物
         run: |
@@ -115,3 +155,4 @@ jobs:
             build.log
             modules-magisk.zip
           if-no-files-found: warn
+
