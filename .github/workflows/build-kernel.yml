@@ -1,1 +1,117 @@
-C:\Users\echt_\WorkBuddy\2026-11-02-19-13-02\droidspaces-kit\.github\workflows\build-kernel.yml
+name: build-apollo-miui-kernel
+
+# 为红米 K30S（apollo / M2007J3SC，MIUI 12.5.5 / Android 11 / 内核 4.19.113）
+# 构建开启 PID/IPC/UTS namespace 的内核，供 Droidspaces 使用。
+# 产物：Image（替换 boot 里的 kernel）、.config、Module.symvers、全部 .ko（打包成 Magisk 模块）
+
+on:
+  workflow_dispatch:
+    inputs:
+      paranoid_net_off:
+        description: '把 CONFIG_ANDROID_PARANOID_NETWORK 关掉（容器内没网时才勾）'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: 取出本仓库文件
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses5 \
+            device-tree-compiler cpio python3 rsync zip unzip wget git \
+            liblz4-tool zlib1g-dev
+
+      - name: 拉取小米开源内核（apollo-q-oss, 4.19.113）
+        run: git clone --depth=1 -b apollo-q-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel
+
+      - name: 拉取工具链（clang r383902 + gcc 4.9 预编译）
+        run: |
+          git clone --depth=1 -b 10 https://github.com/AOSP-10/prebuilts_clang_host_linux-x86_clang-r383902.git clang
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
+          chmod +x clang/bin/* || true
+          ./clang/bin/clang --version
+
+      - name: 打上 Droidspaces 的 non-GKI 补丁（失败不阻断）
+        run: |
+          curl -sL -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/ravindu644/Droidspaces-OSS/contents/Documentation/resources/kernel-patches/non-GKI/01.fix_kernel_panic_in_xt_qtaguid.patch" -o 01.patch
+          curl -sL -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/ravindu644/Droidspaces-OSS/contents/Documentation/resources/kernel-patches/non-GKI/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch" -o 02.patch
+          head -3 01.patch; head -3 02.patch
+          cd kernel
+          patch -p1 --forward < ../01.patch || echo "::warning::01 补丁未应用（4.19 上可能不适用），继续"
+          patch -p1 --forward < ../02.patch || echo "::warning::02 补丁未应用（4.19 上可能不适用），继续"
+
+      - name: 生成 defconfig（真机配置 + delta）
+        run: |
+          cp k30s_config.txt kernel/arch/arm64/configs/vendor/apollo_miui_defconfig
+          cat defconfig.delta >> kernel/arch/arm64/configs/vendor/apollo_miui_defconfig
+          if [ "${{ inputs.paranoid_net_off }}" = "true" ]; then
+            echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> kernel/arch/arm64/configs/vendor/apollo_miui_defconfig
+            echo "已关闭 ANDROID_PARANOID_NETWORK"
+          fi
+          tail -20 kernel/arch/arm64/configs/vendor/apollo_miui_defconfig
+
+      - name: 编译
+        run: |
+          set -e
+          export PATH="$PWD/clang/bin:$PATH"
+          mkdir -p out
+          COMMON="ARCH=arm64 SUBARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=$PWD/gcc64/bin/aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=$PWD/gcc32/bin/arm-linux-androideabi-"
+          make -C kernel O=$PWD/out $COMMON vendor/apollo_miui_defconfig
+          make -C kernel O=$PWD/out $COMMON -j$(nproc) 2>&1 | tee build.log
+
+      - name: 校验产物
+        run: |
+          echo "===== utsrelease（必须等于 4.19.113-perf-g62242b28117e）====="
+          cat out/include/generated/utsrelease.h
+          echo "===== 关键配置 ====="
+          grep -E '^CONFIG_(PID_NS|IPC_NS|SYSVIPC|POSIX_MQUEUE|DEVTMPFS|USER_NS|NET_NS|UTS_NS|SMP|PREEMPT|MODVERSIONS|MODULE_UNLOAD|MACVLAN|CFS_BANDWIDTH|CGROUP_PIDS)=' out/.config || true
+          echo "===== CRC 比对（基准 module_layout=0xeacc760d wake_up_process=0xbbe31357）====="
+          grep -E 'module_layout|wake_up_process|printk|kfree|kmalloc_caches' out/Module.symvers || true
+          echo "===== 内核镜像 ====="
+          ls -l out/arch/arm64/boot/Image
+
+      - name: 打包全部 .ko 成 Magisk 覆盖模块（备用方案）
+        if: always()
+        run: |
+          set -e
+          mkdir -p magisk/system/vendor/lib/modules
+          find out -name '*.ko' -exec cp {} magisk/system/vendor/lib/modules/ \; || true
+          COUNT=$(ls magisk/system/vendor/lib/modules/*.ko 2>/dev/null | wc -l)
+          echo "收集到 $COUNT 个模块"
+          cat > magisk/module.prop <<'EOF'
+          id=apollo_miui_droidspaces_modules
+          name=K30S Droidspaces 内核模块
+          version=v1
+          versionCode=1
+          author=local-build
+          description=用自编内核配套的 /vendor/lib/modules 覆盖原厂模块（仅在原厂模块 CRC 不匹配时使用）
+          EOF
+          cd magisk && zip -r ../modules-magisk.zip . || true
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apollo-miui-kernel
+          path: |
+            out/arch/arm64/boot/Image
+            out/.config
+            out/Module.symvers
+            out/include/generated/utsrelease.h
+            build.log
+            modules-magisk.zip
+          if-no-files-found: warn
