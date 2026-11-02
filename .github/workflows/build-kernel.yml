@@ -77,20 +77,46 @@ jobs:
 
       - name: 编译
         run: |
-          set -o pipefail
           set -x
+          # 全程写入 build.log，方便失败诊断；不要用 head 截断管道（会触发 SIGPIPE）
+          : > build.log
+          echo "=== 工作目录 ===" | tee -a build.log
+          pwd | tee -a build.log
+
+          echo "=== 工具链检查 ===" | tee -a build.log
+          ls -l clang/bin/clang | tee -a build.log || true
+          ls -l gcc64/bin/aarch64-linux-android-gcc | tee -a build.log || true
+          ls -l gcc32/bin/arm-linux-androideabi-gcc | tee -a build.log || true
+
           export PATH="$PWD/clang/bin:$PATH"
-          clang --version || true
-          make --version | head -1
+          clang --version > /tmp/clangver.txt 2>&1 || true
+          sed -n '1,3p' /tmp/clangver.txt | tee -a build.log
+          make --version > /tmp/mkver.txt 2>&1 || true
+          sed -n '1p' /tmp/mkver.txt | tee -a build.log
+          nproc | tee -a build.log
+
           mkdir -p out
-          # HOSTCFLAGS=-fcommon：兜一层，防止其它老 host 工具再撞 -fno-common
           COMMON="ARCH=arm64 SUBARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=$PWD/gcc64/bin/aarch64-linux-android- \
             CROSS_COMPILE_ARM32=$PWD/gcc32/bin/arm-linux-androideabi- \
             HOSTCFLAGS=-fcommon"
-          make -C kernel O=$PWD/out $COMMON vendor/apollo_miui_defconfig 2>&1 | tee -a build.log
-          make -C kernel O=$PWD/out $COMMON -j$(nproc) 2>&1 | tee -a build.log
+
+          echo "=== 阶段1: defconfig ===" | tee -a build.log
+          set +e
+          make -C kernel O=$PWD/out $COMMON vendor/apollo_miui_defconfig >> build.log 2>&1
+          RC1=$?
+          echo "RC1(defconfig)=$RC1"
+          if [ "$RC1" != "0" ]; then
+            echo "::error title=defconfig失败::$RC1"
+            exit 1
+          fi
+
+          echo "=== 阶段2: make -j$(nproc) ===" | tee -a build.log
+          make -C kernel O=$PWD/out $COMMON -j$(nproc) >> build.log 2>&1
+          RC2=$?
+          echo "RC2(build)=$RC2"
+          exit $RC2
 
       - name: 失败诊断
         if: failure()
@@ -101,17 +127,21 @@ jobs:
       - name: 失败诊断-日志回显
         if: failure()
         run: |
-          # 把 build.log 最后 20 行逐行变成 error 标注，这样仓库是 public 时
-          # 可以直接通过 /check-runs/{id}/annotations 从外部读到，无需登录下载日志
-          N=0
-          tail -n 20 build.log 2>/dev/null | while IFS= read -r line; do
-            N=$((N+1))
-            clean=$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g; s/\r//g' | cut -c1-300)
-            echo "::error title=build.log tail #$N::$clean"
-          done
+          # 把关键错误行写成 error 标注，公开仓库可被外部接口读到（无需登录下载日志）
           if [ ! -f build.log ]; then
-            echo "::error title=no build.log::build.log 不存在，说明 make 前就退出了"
+            echo "::error title=no-build.log::build.log 不存在，说明在 make 之前就退出了"
+            exit 0
           fi
+          echo "===== 有效错误行 ====="
+          grep -nE '(\*\*\*|error:|Error [0-9]|No such file|undefined reference|unrecognized|cannot find)' build.log | tail -n 8 | while IFS= read -r line; do
+            clean=$(printf '%s' "$line" | tr -d '\r' | cut -c1-280)
+            echo "::error title=err::$clean"
+          done
+          echo "===== 最后 8 行上下文 ====="
+          tail -n 8 build.log | while IFS= read -r line; do
+            clean=$(printf '%s' "$line" | tr -d '\r' | cut -c1-280)
+            echo "::error title=tail::$clean"
+          done
 
       - name: 校验产物
         run: |
@@ -155,4 +185,3 @@ jobs:
             build.log
             modules-magisk.zip
           if-no-files-found: warn
-
