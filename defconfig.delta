@@ -1,0 +1,41 @@
+# Droidspaces 内核 delta —— 追加到 k30s_config.txt 末尾
+# kconfig 以最后一次赋值为准，所以这里的行会覆盖上面的原厂设置
+
+# ===== 1. 复刻原厂 vermagic（必须，否则 /vendor 模块全部拒载）=====
+# 原厂模块里的 vermagic: 4.19.113-perf-g62242b28117e SMP preempt mod_unload modversions aarch64
+CONFIG_LOCALVERSION="-perf-g62242b28117e"
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# ===== 2. 容器必需的 namespace / IPC =====
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_PID_NS=y
+CONFIG_IPC_NS=y
+CONFIG_NET_NS=y
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+
+# ===== 3. devtmpfs（GPU / USB / 传感器直通）=====
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# ===== 4. NAT 网络模式 =====
+CONFIG_NETFILTER_ADVANCED=y
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+
+# ===== 5. 可选功能（不影响启动，按需）=====
+# 容器内跑 Docker / Podman、允许沙箱
+CONFIG_USER_NS=y
+# macvlan 网络模式
+CONFIG_MACVLAN=y
+# --pids-limit / --cpus 资源限制
+CONFIG_CGROUP_PIDS=y
+CONFIG_CFS_BANDWIDTH=y
+
+# ===== 6. 必须保持原样的项（写在这里是防止被误改）=====
+# vermagic 里带 modversions，关掉会导致 vermagic 不匹配，反而更糟
+CONFIG_MODVERSIONS=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_SMP=y
+CONFIG_PREEMPT=y
